@@ -1,0 +1,29 @@
+services:
+  api:
+    build:
+      context: .
+    image: rainmosaic:latest
+    container_name: rainmosaic-api
+    restart: unless-stopped
+    ports:
+      - "${RAINMOSAIC_PUBLISHED_PORT:-8000}:8000"
+    environment:
+      RAINMOSAIC_DATA_DIR: /data
+      RAINMOSAIC_PORT: "8000"
+      RAINMOSAIC_MAX_UPLOAD_BYTES: "${RAINMOSAIC_MAX_UPLOAD_BYTES:-2097152}"
+      RAINMOSAIC_LOG_LEVEL: "${RAINMOSAIC_LOG_LEVEL:-INFO}"
+    volumes:
+      - rainmosaic-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  rainmosaic-data:
