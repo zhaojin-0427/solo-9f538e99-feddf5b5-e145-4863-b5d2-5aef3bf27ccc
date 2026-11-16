@@ -23,14 +23,16 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/api/v1/mosaics` | Submit two blocks; publishes a new version |
-| GET | `/api/v1/mosaics` | List versions, newest first (`day`, `limit`, `offset`) |
+| GET | `/api/v1/mosaics` | List versions, newest first (`day`, `limit`, `offset`, `include_retired`) |
 | GET | `/api/v1/mosaics/current` | Current version metadata |
-| GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
+| GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version (retired ones included) |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
+| POST | `/api/v1/mosaics/{version}/retire` | Retire a superseded version and reclaim its image |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
 | GET | `/healthz` | Liveness, database and current-version check |
 
-`/docs` supports submitting (multipart form), browsing and downloading.
+`/docs` supports submitting (multipart form), browsing, downloading and
+retiring.
 
 ### Submitting
 
@@ -94,6 +96,44 @@ Every version keeps its own immutable file, so `GET /api/v1/mosaics/{version}/do
 always returns exactly the bytes registered under that version (with a stable
 SHA-256 `ETag`), including after restarts.
 
+### Retiring superseded versions
+
+`POST /api/v1/mosaics/{version}/retire` frees the volume space held by an image
+that a newer version of the same day has replaced. The optional body is
+`{"retired_by": "...", "reason": "..."}`; both fields are just recorded.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/mosaics/1/retire \
+  -H 'content-type: application/json' \
+  -d '{"retired_by": "ops", "reason": "replaced by v2"}'
+```
+
+* **Only a superseded version may be retired.** If no higher version for the
+  same `day` is published, the request returns `409 not_superseded`, the
+  winner's `latest_version` is reported, and nothing is written.
+* **Metadata is kept.** `GET /api/v1/mosaics/{version}` still reports the full
+  descriptor, including the original SHA-256 and byte size, and adds
+  `retired: true`, `downloadable: false`, `reclaim_status` and a `retirement`
+  record (`retired_at`, `retired_by`, `reason`, `reclaimed_at`,
+  `reclaim_error`).
+* **`reclaim_status`** is `pending` while the file is still queued for removal
+  and `reclaimed` once it is gone. `GET /api/v1/mosaics` includes retired
+  versions by default (`include_retired=false` hides them).
+* **New downloads return `410 version_retired`** as soon as the retirement is
+  registered. A download *admitted before* the retirement keeps reading the
+  original bytes: the server streams from a descriptor opened at admission
+  time, so unlinking the path cannot truncate it, and a slow download never
+  holds a lock that publishing or another retirement needs.
+* **Repeating the request is idempotent** and returns the same retirement
+  record with `reused: true`.
+* **Failure handling.** If the retirement cannot be registered, the request
+  returns `500 retire_failed` and the version stays fully downloadable. If
+  registration succeeds but the unlink fails, the version stays retired
+  (`reclaim_status: pending`, `reclaim_error` set) and is never downloadable
+  again; startup reconciliation removes the file and settles the record. Only
+  `versions/v{version}.tif` for that exact version is ever removed, so other
+  versions are untouched.
+
 ### Errors
 
 Errors use `{"detail": {...}}` with `code` and `message`; raster errors also
@@ -104,11 +144,19 @@ carry `slot` (`a`/`b`) and, where applicable, `field` (`crs`, `resolution`,
 
 * SQLite runs in WAL mode with `synchronous=FULL`; state lives in
   `$RAINMOSAIC_DATA_DIR/rainmosaic.sqlite3`, images in `versions/`, scratch files
-  in `tmp/`.
-* Startup validates the schema, repairs a dangling current pointer and removes
-  old orphan files left by interrupted publications.
+  in `tmp/`. Retirement records are additive rows; existing databases are
+  upgraded in place on startup (the original `versions` rows are not modified).
+* Startup validates the schema, repairs a dangling current pointer, removes
+  old orphan files left by interrupted publications and retries any pending
+  retired-file reclaim.
 * Generation and file I/O run in a worker thread so other requests, including
   downloads, keep flowing.
+* Download admission holds a short-lived lock while it checks the version and
+  opens the image descriptor; file removal takes the same lock. Streaming the
+  body holds no lock. On POSIX the open descriptor guarantees an admitted
+  download reads every original byte even after its path is removed, while a
+  retirement that got the lock first makes new downloads see `410`. A slow
+  download therefore never delays publishing or another retirement.
 * Only one API worker is used by default: SQLite plus a local disk volume make
   horizontal scaling a deployment concern rather than a code feature.
 
@@ -123,7 +171,10 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination, error handling, and
+retirement (supersede gating, metadata/SHA retention, 410, in-flight and slow
+downloads, idempotency, registration failure, unlink failure and restart
+recovery).
 
 ## Configuration
 
